@@ -8,13 +8,26 @@
 #include <cub/cub.cuh>
 #include <torch/extension.h>
 
-#include "cutlass/bfloat16.h"
-#include "cutlass/complex.h"
-#include "cutlass/gemm/kernel/gemm_grouped.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
-#include "cutlass/gemm/device/gemm_grouped.h"
+// #include "cutlass/bfloat16.h"
+// #include "cutlass/complex.h"
+// #include "cutlass/gemm/kernel/gemm_grouped.h"
+// #include "cutlass/gemm/kernel/default_gemm_grouped.h"
+// #include "cutlass/gemm/device/gemm_grouped.h"
 
-#include <type_traits>
+#include "cutlass/cutlass.h"
+
+#include "cute/tensor.hpp"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+
+// #include <type_traits>
 
 namespace grouped_gemm {
 
@@ -38,6 +51,83 @@ namespace grouped_gemm {
 template <bool trans>
 using GroupedGemmInputLayout = std::conditional_t<trans, ::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor>;
 
+using namespace cute;
+using ProblemShape = ::cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
+// Element type for A matrix operand
+using ElementA = ::cutlass::bfloat16_t; // ::cutlass::float_e4m3_t;
+// Element type for B matrix operand
+using ElementB = ::cutlass::bfloat16_t; // ::cutlass::float_e5m2_t;
+// Element type for C and D matrix operands
+using ElementC = ::cutlass::bfloat16_t; // ::cutlass::half_t;
+
+// Alignment in units of elements (up to 16 bytes)
+constexpr int AlignmentA  = 128 / ::cutlass::sizeof_bits<ElementA>::value;
+constexpr int AlignmentB  = 128 / ::cutlass::sizeof_bits<ElementB>::value;
+constexpr int AlignmentC  = 128 / ::cutlass::sizeof_bits<ElementC>::value;
+
+// Core kernel configurations
+using ElementAccumulator  = float;                                          // Element type for internal accumulation
+using ArchTag             = ::cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
+using OperatorClass       = ::cutlass::arch::OpClassTensorOp;                 // Operator class tag
+using StageCountType = ::cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
+
+struct CooperativeConfig {
+  //using KernelSchedule = ::cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum;
+  using KernelSchedule = ::cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+  using EpilogueSchedule = ::cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+  using TileShape           = Shape<_256,_128,_128>;
+  using ClusterShape        = Shape<_2,_2,_1>;
+};
+
+template <typename ScheduleConfig, bool trans_a, bool trans_b>
+struct GemmGivenSchedule {
+  using TileShape           = typename ScheduleConfig::TileShape;                   // Threadblock-level tile size
+  using ClusterShape        = typename ScheduleConfig::ClusterShape;                // Shape of the threadblocks in a cluster
+  using KernelSchedule      = typename ScheduleConfig::KernelSchedule;              // Kernel to launch
+  using EpilogueSchedule    = typename ScheduleConfig::EpilogueSchedule;            // Epilogue to launch
+
+  using LayoutA = GroupedGemmInputLayout<trans_a>;
+  using LayoutB = GroupedGemmInputLayout<trans_b>;
+  using LayoutC = ::cutlass::layout::RowMajor;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    TileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, LayoutC *, AlignmentC,
+    ElementC, LayoutC *, AlignmentC,
+    EpilogueSchedule,
+    cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>
+  >::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementA, LayoutA *, AlignmentA,
+    ElementB, LayoutB *, AlignmentB,
+    ElementAccumulator,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    KernelSchedule
+  >::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    ProblemShape,
+    CollectiveMainloop,
+    CollectiveEpilogue
+  >;
+
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+template <bool trans_a, bool trans_b>
+using GroupedGemmKernel = typename GemmGivenSchedule<CooperativeConfig, trans_a, trans_b>::GemmKernel;
+
+template <bool trans_a, bool trans_b>
+using GemmGrouped = typename GemmGivenSchedule<CooperativeConfig, trans_a, trans_b>::Gemm;
+
+/*
 using GroupedGemmConfig = ::cutlass::gemm::device::DefaultGemmConfiguration<
   ::cutlass::arch::OpClassTensorOp,
   ::cutlass::arch::Sm80,
@@ -79,6 +169,7 @@ using GroupedGemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
 
 template <bool trans_a, bool trans_b>
 using GemmGrouped = ::cutlass::gemm::device::GemmGrouped<GroupedGemmKernel<trans_a, trans_b>>;
+*/
 
 template <typename T>
 torch::Tensor CopyToDevice(const std::vector<T> &x, const torch::Device &device) {
@@ -133,7 +224,7 @@ RawGemmArguments MakeArgumentsOnDevice(int num_experts, const torch::Device& dev
       .problem_sizes = TypedEmpty<cutlass::gemm::GemmCoord>(num_experts, device),
 
       // We don't know the problem dimensions on the host, so we just base the number of threadblocks on occupancy here.
-      .threadblock_count = Gemm::sufficient(),
+      //.threadblock_count = Gemm::sufficient(),
     };
 }
 
@@ -217,7 +308,7 @@ RawGemmArguments MakeArgumentsOnHost(torch::Tensor a,
     .problem_sizes = CopyToDevice(problem_sizes_host, a.device()),
 
     // We know the problem dimensions on the host, so we can calculate the number of threadblocks based on that.
-    .threadblock_count = Gemm::sufficient(problem_sizes_host.data(), num_experts),
+    //.threadblock_count = Gemm::sufficient(problem_sizes_host.data(), num_experts),
   };
 }
 
@@ -249,28 +340,66 @@ typename Gemm::Arguments MakeArguments(torch::Tensor a,
 
   // Validate the result.
   if (!raw_args.threadblock_count) {
-    TORCH_CHECK(false, "Grouped GEMM execution not possible with HW");
+    // TORCH_CHECK(false, "Grouped GEMM execution not possible with HW");
   }
 
-  typename Gemm::EpilogueOutputOp::Params epilogue_op(/*alpha=*/1.0f, /*beta=*/0.0f);
+  ::cutlass::KernelHardwareInfo kernel_hw_info = ::cutlass::KernelHardwareInfo::make_kernel_hardware_info<Gemm::GemmKernel>(a.device().index());
+
+  typename Gemm::Arguments arguments;
+  decltype(arguments.epilogue.thread) fusion_args;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  // Single alpha and beta for all groups
+  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+
+  arguments = typename Gemm::Arguments {
+    ::cutlass::gemm::GemmUniversalMode::kGrouped,
+    {
+      (int)num_experts,
+      (cutlass::gemm::GemmCoord*)raw_args.problem_sizes.data_ptr(),
+      nullptr,
+    },
+    {
+      (ElementA**)raw_args.ptr_a.data_ptr(),
+      (int64_t*)raw_args.lda.data_ptr(),
+      (ElementB**)raw_args.ptr_b.data_ptr(),
+      (int64_t*)raw_args.ldb.data_ptr()
+    },
+    {
+      fusion_args,
+      (ElementC**)raw_args.ptr_c.data_ptr(),
+      (int64_t*)raw_args.ldc.data_ptr(),
+      (ElementC**)raw_args.ptr_c.data_ptr(),
+      (int64_t*)raw_args.ldc.data_ptr()
+    },
+    kernel_hw_info
+  };
+  return arguments;
+
+  // typename Gemm::EpilogueOutputOp::Params epilogue_op(/*alpha=*/1.0f, /*beta=*/0.0f);
   // We currently always use `GroupScheduleMode::kDeviceOnly`, which doesn't use `host_problem_sizes` at all,
   // so we can safely pass `nullptr` for `host_problem_sizes`.
   // TODO(tgale): Experiment with `GroupScheduleMode::kHostPrecompute` for `batch_sizes.is_cpu()`, where we
   // know the problem dimensions on the host.
-  typename Gemm::Arguments arguments((cutlass::gemm::GemmCoord*)raw_args.problem_sizes.data_ptr(),
-				     (int)num_experts,
-				     (int)raw_args.threadblock_count,
-				     epilogue_op,
-				     (ElementA**)raw_args.ptr_a.data_ptr(),
-				     (ElementB**)raw_args.ptr_b.data_ptr(),
-				     (ElementC**)raw_args.ptr_c.data_ptr(),
-				     (ElementC**)raw_args.ptr_c.data_ptr(),
-				     /*lda=*/(int64_t*)raw_args.lda.data_ptr(),
-				     /*ldb=*/(int64_t*)raw_args.ldb.data_ptr(),
-				     /*ldc=*/(int64_t*)raw_args.ldc.data_ptr(),
-				     /*ldd=*/(int64_t*)raw_args.ldc.data_ptr(),
-				     /*host_problem_sizes=*/nullptr);
-  return arguments;
+  // typename Gemm::Arguments arguments((cutlass::gemm::GemmCoord*)raw_args.problem_sizes.data_ptr(),
+	// 			     (int)num_experts,
+	// 			     (int)raw_args.threadblock_count,
+	// 			     epilogue_op,
+	// 			     (ElementA**)raw_args.ptr_a.data_ptr(),
+	// 			     (ElementB**)raw_args.ptr_b.data_ptr(),
+	// 			     (ElementC**)raw_args.ptr_c.data_ptr(),
+	// 			     (ElementC**)raw_args.ptr_c.data_ptr(),
+	// 			     /*lda=*/(int64_t*)raw_args.lda.data_ptr(),
+	// 			     /*ldb=*/(int64_t*)raw_args.ldb.data_ptr(),
+	// 			     /*ldc=*/(int64_t*)raw_args.ldc.data_ptr(),
+	// 			     /*ldd=*/(int64_t*)raw_args.ldc.data_ptr(),
+	// 			     /*host_problem_sizes=*/nullptr);
+  // return arguments;
 }
 
 template <
